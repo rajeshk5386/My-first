@@ -1,0 +1,774 @@
+Database File Sizes
+
+select
+      name
+    , filename
+    , convert(decimal(12,2),round(a.size/128.000/1024,2)) as FileSizeGB
+    , convert(decimal(12,2),round(fileproperty(a.name,'SpaceUsed')/128.000/1024,2)) as SpaceUsedGB
+    , convert(decimal(12,2),round((a.size-fileproperty(a.name,'SpaceUsed'))/128.000/1024,2)) as FreeSpaceGB
+    from dbo.sysfiles a
+
+----------------------------
+Disk space 
+
+SELECT 
+Volume, 
+CAST(SizeGB as DECIMAL(10,2)) CapacityGB, 
+CAST(FreeGB as DECIMAL(10,2)) FreeGB, 
+CAST([%Free] as DECIMAL(10,2))[%Free] 
+FROM( 
+SELECT distinct(volume_mount_point) Volume,  
+  (total_bytes/1048576)/1024.00 as SizeGB,  
+  (available_bytes/1048576)/1024.00 as FreeGB, 
+  (select ((available_bytes/1048576* 1.0)/(total_bytes/1048576* 1.0) *100)) as '%Free' 
+FROM sys.master_files AS f CROSS APPLY  
+  sys.dm_os_volume_stats(f.database_id, f.file_id) 
+group by volume_mount_point, total_bytes/1048576,  
+  available_bytes/1048576 
+  )T 
+
+-----------------------------------------------------------
+Objects owned by Schema
+
+SELECT * 
+FROM sys.objects 
+WHERE schema_id = SCHEMA_ID('dbo')
+
+-------------------------------------------------------
+Query to check when SQL Server restarted.
+
+1) SELECT sqlserver_start_time FROM sys.dm_os_sys_info;  
+2) SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = 1;  
+3) select start_time from sys.traces where is_default = 1  
+4) SELECT crdate FROM sysdatabases WHERE name='tempdb'  
+5) SELECT create_date FROM sys.databases WHERE name = 'tempdb' 
+
+------------------------------
+select 	Name,
+'Maxsize_MB' = (case
+maxsize when -1 then N'Unlimited'
+  else
+convert (int, round((maxsize) * (8192.0/1048576),0)) end),
+(convert (int, round((size) * (8192.0/1048576),0))) FileSize_MB,
+(convert (int, round(((fileproperty(name,'SpaceUsed'))) *
+ (8192.0/1048576),0))) Used_MB, 
+((convert(int, round(((size)) * (8192.0/1048576) - 
+(convert(int,fileproperty(name,'SpaceUsed'))) *
+ (8192.0/1048576),0)))) Free_MB,
+'Growth_MB' = (case status & 0x100000 when 0x100000 then
+  convert(nvarchar(3), growth) + N'%'
+else
+--  convert(nvarchar(15), growth * 8) end)
+convert (int, round((growth) * (8192.0/1048576),0)) end)
+from sysfiles
+order by 
+fileproperty(name,'IsLogFile')
+
+----------------------------------------------------------------------------
+For All DB's
+
+set nocount on
+ 
+create table #dbfileInfo(
+name varchar(300),
+location varchar(300),
+filesizeMB decimal(9,2),
+spaceUsedMB decimal(9,2),
+FreespaceMB decimal(9,2))
+ 
+declare @mySQL nvarchar(2000)
+DECLARE @dbName varchar(MAX)
+DECLARE @cur_DBName CURSOR
+ 
+SET @cur_DBName = CURSOR FOR
+select name from sys.databases
+ 
+OPEN @cur_DBName
+FETCH NEXT
+FROM @cur_DBName INTO @dbName
+WHILE @@FETCH_STATUS = 0
+BEGIN
+PRINT @dbName
+if DATABASEPROPERTYEX(@dbName, 'status') = 'ONLINE'
+begin
+select @mySQL = 
+    '
+        use ' + @dbname + '
+        INSERT INTO #dbfileInfo
+        select
+      name
+    , filename
+    , convert(decimal(12,2),round(a.size/128.000/1024,2)) as FileSizeMB
+    , convert(decimal(12,2),round(fileproperty(a.name,''SpaceUsed'')/128.000/1024,2)) as SpaceUsedMB
+    , convert(decimal(12,2),round((a.size-fileproperty(a.name,''SpaceUsed''))/128.000/1024,2)) as FreeSpaceMB
+    from dbo.sysfiles a
+    '
+    exec sp_executesql @mySQL
+end
+FETCH NEXT
+FROM @cur_DBName INTO @dbName
+ 
+END
+CLOSE @cur_DBName
+DEALLOCATE @cur_DBName
+GO
+ 
+select * from #dbfileInfo
+drop table #dbfileInfo
+
+From <http://sqldbpool.com/2013/05/26/t-sql-script-to-find-out-the-database-file-size-space-used-and-available-free-space/
+
+
+Find locked sql accounts
+
+SELECT name, is_disabled, LOGINPROPERTY(name, N'isLocked') as is_locked
+FROM sys.sql_logins
+WHERE LOGINPROPERTY(name, N'isLocked') = 1
+ORDER BY name;
+--select name, modify_date from sys.sql_logins
+
+Find last password change date
+
+SELECT LOGINPROPERTY('<login name>', 'PasswordLastSetTime');
+
+
+Find backup location
+
+select physical_device_name, backup_start_date, backup_finish_date
+from msdb.dbo.backupset b join msdb.dbo.backupmediafamily m ON b.media_set_id = m.media_set_id
+--where database_name = 'DB1'
+order by backup_finish_date DESC
+
+
+Last User read and Writes to tables.
+
+We can answer the question about access to a database simply by aggregating the data in the DMV to the database level:
+
+
+USE AdventureWorks;
+GO
+
+SET ANSI_WARNINGS OFF;
+SET NOCOUNT ON;
+GO
+
+WITH agg AS
+(
+    SELECT 
+        last_user_seek,
+        last_user_scan,
+        last_user_lookup,
+        last_user_update
+    FROM
+        sys.dm_db_index_usage_stats
+    WHERE
+        database_id = DB_ID()
+)
+SELECT
+    last_read = MAX(last_read),
+    last_write = MAX(last_write)
+FROM
+(
+    SELECT last_user_seek, NULL FROM agg
+    UNION ALL
+    SELECT last_user_scan, NULL FROM agg
+    UNION ALL
+    SELECT last_user_lookup, NULL FROM agg
+    UNION ALL
+    SELECT NULL, last_user_update FROM agg
+) AS x (last_read, last_write);
+
+Switching focus to each table is accomplished by adding the object name to the GROUP BY (and as Jerry pointed out, this will require SP2 to use OBJECT_SCHEMA_NAME(), otherwise you can join against sys.tables and sys.schemas):
+
+
+USE AdventureWorks;
+GO
+
+SET ANSI_WARNINGS OFF;
+SET NOCOUNT ON;
+GO
+
+WITH agg AS
+(
+    SELECT 
+        [object_id],
+        last_user_seek,
+        last_user_scan,
+        last_user_lookup,
+        last_user_update
+    FROM
+        sys.dm_db_index_usage_stats
+    WHERE
+        database_id = DB_ID()
+)
+SELECT
+    [Schema] = OBJECT_SCHEMA_NAME([object_id]),
+    [Table_Or_View] = OBJECT_NAME([object_id]),
+    last_read = MAX(last_read),
+    last_write = MAX(last_write)
+FROM
+(
+    SELECT [object_id], last_user_seek, NULL FROM agg
+    UNION ALL
+    SELECT [object_id], last_user_scan, NULL FROM agg
+    UNION ALL
+    SELECT [object_id], last_user_lookup, NULL FROM agg
+    UNION ALL
+    SELECT [object_id], NULL, last_user_update FROM agg
+) AS x ([object_id], last_read, last_write)
+GROUP BY
+    OBJECT_SCHEMA_NAME([object_id]),
+    OBJECT_NAME([object_id])
+ORDER BY 1,2;
+
+From <http://sqlblog.com/blogs/aaron_bertrand/archive/2008/05/06/when-was-my-database-table-last-accessed.aspx> 
+
+-- Get selected server properties (SQL Server 2012)  (Query 3) (Server Properties)
+
+SELECT SERVERPROPERTY('MachineName') AS [MachineName], SERVERPROPERTY('ServerName') AS [ServerName],  
+SERVERPROPERTY('InstanceName') AS [Instance], SERVERPROPERTY('IsClustered') AS [IsClustered], 
+SERVERPROPERTY('ComputerNamePhysicalNetBIOS') AS [ComputerNamePhysicalNetBIOS], 
+SERVERPROPERTY('Edition') AS [Edition], SERVERPROPERTY('ProductLevel') AS [ProductLevel], 
+SERVERPROPERTY('ProductVersion') AS [ProductVersion], SERVERPROPERTY('ProcessID') AS [ProcessID],
+SERVERPROPERTY('Collation') AS [Collation], SERVERPROPERTY('IsFullTextInstalled') AS [IsFullTextInstalled], 
+SERVERPROPERTY('IsIntegratedSecurityOnly') AS [IsIntegratedSecurityOnly],
+SERVERPROPERTY('IsHadrEnabled') AS [IsHadrEnabled], SERVERPROPERTY('HadrManagerStatus') AS [HadrManagerStatus];
+
+--orphan users-----------------------
+
+--Find windows logins
+select users.name 
+from master..syslogins logins right join sysusers users on logins.sid = users.sid 
+where logins.sid is null and issqlrole <> 1 and isapprole <> 1   
+and (users.name <> 'INFORMATION_SCHEMA' and users.name not in ('guest', 'dbo', 'sys'))
+
+
+--sp_change_users_login 'report'
+SET NOCOUNT ON
+DECLARE @User sysname
+DECLARE @NameFound bit
+DECLARE orphan_cursor CURSOR FOR 
+-- The follow select statement was lifted from sp_change_users_login
+-- under the area where the REPORT parameter is passed in and then 
+-- modified.  Its purpose is to identify users in the database that 
+-- do not match to a corresponding login by sid and then identify 
+-- whether or not there is a corresponding login by name
+        select 
+                        name as UserName,
+                        CASE WHEN suser_sid(name) is not null
+                                    THEN 1
+                                    ELSE 0
+                       END as NameFound
+            from sysusers
+        where issqluser = 1 
+            and (sid is not null and sid <> 0x0)
+            and suser_sname(sid) is null
+        order by name
+OPEN orphan_cursor
+FETCH NEXT FROM orphan_cursor into @User, @NameFound
+WHILE @@FETCH_STATUS = 0
+BEGIN
+            if @NameFound = 1
+            begin
+                        select 'Synchronizing user '+@User+' with login '+@User
+                        exec sp_change_users_login 'UPDATE_ONE', @User, @User
+            end
+            else
+            begin
+                        select 'No matching login found for user '+@User
+            end
+            FETCH NEXT FROM orphan_cursor into @User, @NameFound
+END
+CLOSE orphan_cursor
+DEALLOCATE orphan_cursor
+
+----------------------sp_who3  active--------------------------------------------------------
+
+USE MASTER 
+GO 
+SELECT SPID,ER.percent_complete, 
+/* This piece of code has been taken from article. Nice code to get time criteria's 
+http://beyondrelational.com/blogs/geniiius/archive/2011/11/01/backup-restore-checkdb-shrinkfile-progress.aspx 
+*/ 
+    CAST(((DATEDIFF(s,start_time,GetDate()))/3600) as varchar) + ' hour(s), ' 
+        + CAST((DATEDIFF(s,start_time,GetDate())%3600)/60 as varchar) + 'min, ' 
+        + CAST((DATEDIFF(s,start_time,GetDate())%60) as varchar) + ' sec' as running_time, 
+    CAST((estimated_completion_time/3600000) as varchar) + ' hour(s), ' 
+        + CAST((estimated_completion_time %3600000)/60000 as varchar) + 'min, ' 
+        + CAST((estimated_completion_time %60000)/1000 as varchar) + ' sec' as est_time_to_go, 
+    DATEADD(second,estimated_completion_time/1000, getdate()) as est_completion_time, 
+/* End of Article Code */     
+ER.command,ER.blocking_session_id, SP.DBID,LASTWAITTYPE,  
+DB_NAME(SP.DBID) AS DBNAME, 
+SUBSTRING(est.text, (ER.statement_start_offset/2)+1,  
+        ((CASE ER.statement_end_offset 
+         WHEN -1 THEN DATALENGTH(est.text) 
+         ELSE ER.statement_end_offset 
+         END - ER.statement_start_offset)/2) + 1) AS QueryText, 
+TEXT,CPU,HOSTNAME,LOGIN_TIME,LOGINAME, 
+SP.status,PROGRAM_NAME,NT_DOMAIN, NT_USERNAME 
+FROM SYSPROCESSES SP  
+INNER JOIN sys.dm_exec_requests ER 
+ON sp.spid = ER.session_id 
+CROSS APPLY SYS.DM_EXEC_SQL_TEXT(er.sql_handle) EST 
+ORDER BY CPU DESC    
+
+-- Query to find when the database last accessed on SQL Server 2005 / 2008 ---
+
+select d.name, x1 =
+(select X1= max(bb.xx) 
+from (
+    select xx = max(last_user_seek) 
+        where max(last_user_seek) is not null 
+    union all 
+    select xx = max(last_user_scan) 
+        where max(last_user_scan) is not null 
+    union all 
+    select xx = max(last_user_lookup) 
+        where max(last_user_lookup) is not null 
+    union all 
+        select xx = max(last_user_update) 
+        where max(last_user_update) is not null) bb) 
+FROM master.dbo.sysdatabases d 
+left outer join 
+sys.dm_db_index_usage_stats s 
+on d.dbid= s.database_id 
+group by d.name
+
+--------------or----------------------------
+SET ANSI_WARNINGS OFF;
+SET NOCOUNT ON;
+GO
+
+WITH agg AS
+(
+    SELECT 
+        last_user_seek,
+        last_user_scan,
+        last_user_lookup,
+        last_user_update
+    FROM
+        sys.dm_db_index_usage_stats
+    WHERE
+        database_id = DB_ID()
+)
+SELECT
+    last_read = MAX(last_read),
+    last_write = MAX(last_write)
+FROM
+(
+    SELECT last_user_seek, NULL FROM agg
+    UNION ALL
+    SELECT last_user_scan, NULL FROM agg
+    UNION ALL
+    SELECT last_user_lookup, NULL FROM agg
+    UNION ALL
+    SELECT NULL, last_user_update FROM agg
+) AS x (last_read, last_write);
+
+--------------Get port# install date---------
+
+SELECT SERVERNAME = CONVERT(NVARCHAR(128),SERVERPROPERTY('SERVERNAME'))   
+,LOCAL_NET_ADDRESS AS 'IPAddressOfSQLServer'  
+,local_tcp_port  AS 'PortNumber' 
+ FROM SYS.DM_EXEC_CONNECTIONS WHERE SESSION_ID = @@SPID
+
+
+SELECT create_date
+FROM sys.server_principals
+WHERE sid = 0x010100000000000512000000
+
+
+-- List all Objects and Indexes 
+-- per Filegroup / Partition and Allocation Type 
+-- including the allocated data size 
+
+SELECT DS.name AS DataSpaceName 
+      ,AU.type_desc AS AllocationDesc 
+      ,AU.total_pages / 128 AS TotalSizeMB 
+      ,AU.used_pages / 128 AS UsedSizeMB 
+      ,AU.data_pages / 128 AS DataSizeMB 
+      ,SCH.name AS SchemaName 
+      ,OBJ.type_desc AS ObjectType       
+      ,OBJ.name AS ObjectName 
+      ,IDX.type_desc AS IndexType 
+      ,IDX.name AS IndexName 
+FROM sys.data_spaces AS DS 
+     INNER JOIN sys.allocation_units AS AU 
+         ON DS.data_space_id = AU.data_space_id 
+     INNER JOIN sys.partitions AS PA 
+         ON (AU.type IN (1, 3)  
+             AND AU.container_id = PA.hobt_id) 
+            OR 
+            (AU.type = 2 
+             AND AU.container_id = PA.partition_id) 
+     INNER JOIN sys.objects AS OBJ 
+         ON PA.object_id = OBJ.object_id 
+     INNER JOIN sys.schemas AS SCH 
+         ON OBJ.schema_id = SCH.schema_id 
+     LEFT JOIN sys.indexes AS IDX 
+         ON PA.object_id = IDX.object_id 
+            AND PA.index_id = IDX.index_id 
+ORDER BY DS.name 
+        ,SCH.name 
+        ,OBJ.name 
+        ,IDX.name
+
+From <https://gallery.technet.microsoft.com/scriptcenter/c7483555-cc22-4f6c-b9c4-90811eb3bdb6/description> 
+
+
+Script to check when was SQL Server restarted
+
+SELECT sqlserver_start_time FROM sys.dm_os_sys_info;  
+SELECT login_time FROM sys.dm_exec_sessions WHERE session_id = 1;  
+ select start_time from sys.traces where is_default = 1  
+SELECT crdate FROM sysdatabases WHERE name='tempdb'  
+ SELECT create_date FROM sys.databases WHERE name = 'tempdb' 
+
+From <https://gallery.technet.microsoft.com/scriptcenter/Script-to-check-when-was-5d0fe4e8/description> 
+
+
+
+How to find the auto growth settings for all the SQL Server databases
+
+SELECT smf.name AS LogicalName  
+,smf.file_id AS FileID 
+, smf.physical_name AS FileName  
+,CAST(CAST(sf.name AS VARBINARY(256)) AS sysname) AS FileGroupName 
+,CONVERT (varchar(10),(smf.size*8)) + ' KB' AS Size 
+,CASE WHEN smf.[max_size]=-1 THEN 'Unlimited' ELSE CONVERT(VARCHAR(10),CONVERT(bigint,smf.max_size)*8) +' KB' END AS MaxSize  
+,CASE smf.is_percent_growth WHEN 1 THEN CONVERT(VARCHAR(10),smf.growth) +'%' ELSE Convert(VARCHAR(10),smf.growth*8) +' KB' END AS Growth 
+,Case WHEN smf.[type]=0 THEN 'Data Only'  
+WHEN smf.type = 1 THEN 'Log Only'  
+WHEN smf.type = 2 THEN 'FILESTREAM Only'  
+WHEN smf.type = 3 THEN 'Informational purposes Only'  
+WHEN smf.type = 4 THEN 'Full-text '  
+END AS Usage 
+,DB_name(smf.database_id) AS DatabaseName 
+FROM sys.master_files AS smf 
+LEFT JOIN sys.filegroups AS sf ON ((smf.type = 2 OR smf.type = 0)  
+AND (smf.drop_lsn IS NULL)) AND (smf.data_space_id = sf.data_space_id) 
+ 
+
+From <https://gallery.technet.microsoft.com/scriptcenter/How-to-find-the-auto-9d730ee1/description> 
+
+Query for Locating SQL Server Backups
+
+-- File name : Where are the backups.sql
+-- Author : Graham Okely B App Sc
+-- Scope : OK on SQL Server 2000,2005,2008R2,2012
+-- Select the information we require to make a decision about which backup we want to use
+select  top 5 a.server_name, a.database_name, backup_finish_date, a.backup_size,
+CASE a.[type] -- Let's decode the three main types of backup here
+ WHEN 'D' THEN 'Full'
+ WHEN 'I' THEN 'Differential'
+ WHEN 'L' THEN 'Transaction Log'
+ ELSE a.[type]
+END as BackupType
+ ,b.physical_device_name
+from msdb.dbo.backupset a join msdb.dbo.backupmediafamily b
+  on a.media_set_id = b.media_set_id
+where a.database_name Like 'master%'
+order by a.backup_finish_date desc
+
+From <https://www.mssqltips.com/sqlservertip/2960/sql-server-backup-paths-and-file-management/> 
+
+Listing_4_Database_Backup_Info
+
+SELECT  CONVERT(char(100), SERVERPROPERTY('Servername')) AS Server,
+        msdb.dbo.backupmediafamily.logical_device_name,
+        msdb.dbo.backupmediafamily.physical_device_name,
+        msdb.dbo.backupset.expiration_date,
+        msdb.dbo.backupset.name,
+        msdb.dbo.backupset.description,
+        msdb.dbo.backupset.user_name,
+        msdb.dbo.backupset.backup_start_date,
+        msdb.dbo.backupset.backup_finish_date,
+        CASE msdb..backupset.type
+          WHEN 'D' THEN 'Database'
+          WHEN 'L' THEN 'Log'
+        END AS backup_type,
+        msdb.dbo.backupset.backup_size,
+        msdb.dbo.backupset.database_name,
+        msdb.dbo.backupset.server_name AS Source_Server
+FROM    msdb.dbo.backupmediafamily
+        INNER JOIN msdb.dbo.backupset ON msdb.dbo.backupmediafamily.media_set_id = msdb.dbo.backupset.media_set_id
+WHERE   ( CONVERT(datetime, msdb.dbo.backupset.backup_start_date, 102) >= GETDATE() - 30 )
+
+Script to find current running jobs
+
+SELECT  J.name as Running_Jobs,  
+  JA.Start_execution_date As Starting_time,
+        datediff(ss, JA.Start_execution_date,getdate()) as [Has_been_running(in Sec)]
+FROM msdb.dbo.sysjobactivity JA
+JOIN msdb.dbo.sysjobs J
+ON J.job_id=JA.job_id
+WHERE job_history_id is null
+      AND start_execution_date is NOT NULL
+ORDER BY start_execution_date
+
+From <http://www.sanssql.com/2013/08/t-sql-query-to-find-currently-running.html> 
+
+Check SQL Server Service accounts
+
+SELECT  DSS.servicename,
+        DSS.startup_type_desc,
+        DSS.status_desc,
+        DSS.last_startup_time,
+        DSS.service_account,
+        DSS.is_clustered,
+        DSS.cluster_nodename,
+        DSS.filename,
+        DSS.startup_type,
+        DSS.status,
+        DSS.process_id
+FROM    sys.dm_server_services AS DSS
+
+Query to list tempdb usage per active Session
+ 
+;WITH task_space_usage AS (
+    -- SUM alloc/delloc pages
+    SELECT session_id,
+           request_id,
+           SUM(internal_objects_alloc_page_count) AS alloc_pages,
+           SUM(internal_objects_dealloc_page_count) AS dealloc_pages
+    FROM sys.dm_db_task_space_usage WITH (NOLOCK)
+    WHERE session_id <> @@SPID
+    GROUP BY session_id, request_id
+)
+SELECT TSU.session_id,
+       TSU.alloc_pages * 1.0 / 128 AS [internal object MB space],
+       TSU.dealloc_pages * 1.0 / 128 AS [internal object dealloc MB space],
+       EST.text,
+       -- Extract statement from sql text
+       ISNULL(
+           NULLIF(
+               SUBSTRING(
+                 EST.text, 
+                 ERQ.statement_start_offset / 2, 
+                 CASE WHEN ERQ.statement_end_offset < ERQ.statement_start_offset 
+                  THEN 0 
+                 ELSE( ERQ.statement_end_offset - ERQ.statement_start_offset ) / 2 END
+               ), ''
+           ), EST.text
+       ) AS [statement text],
+       EQP.query_plan
+FROM task_space_usage AS TSU
+INNER JOIN sys.dm_exec_requests ERQ WITH (NOLOCK)
+    ON  TSU.session_id = ERQ.session_id
+    AND TSU.request_id = ERQ.request_id
+OUTER APPLY sys.dm_exec_sql_text(ERQ.sql_handle) AS EST
+OUTER APPLY sys.dm_exec_query_plan(ERQ.plan_handle) AS EQP
+WHERE EST.text IS NOT NULL OR EQP.query_plan IS NOT NULL
+ORDER BY 3 DESC;
+ 
+
+Query to find the space used by Objects in Tempdb
+SELECT
+ SPID = s.session_id,
+ s.[host_name],
+ s.[program_name],
+ s.status,
+ s.memory_usage,
+ granted_memory = CONVERT(INT, r.granted_query_memory*8.00),
+ t.text, 
+ sourcedb = DB_NAME(r.database_id),
+ workdb = DB_NAME(dt.database_id), 
+ mg.*,
+ su.*
+FROM sys.dm_exec_sessions s
+INNER JOIN sys.dm_db_session_space_usage su
+   ON s.session_id = su.session_id
+   AND su.database_id = DB_ID('tempdb')
+INNER JOIN sys.dm_exec_connections c
+   ON s.session_id = c.most_recent_session_id
+LEFT OUTER JOIN sys.dm_exec_requests r
+   ON r.session_id = s.session_id
+LEFT OUTER JOIN (
+   SELECT
+    session_id,
+    database_id
+   FROM sys.dm_tran_session_transactions t
+   INNER JOIN sys.dm_tran_database_transactions dt
+      ON t.transaction_id = dt.transaction_id 
+   WHERE dt.database_id = DB_ID('tempdb')
+   GROUP BY  session_id,  database_id
+   ) dt
+   ON s.session_id = dt.session_id
+ CROSS APPLY sys.dm_exec_sql_text(COALESCE(r.sql_handle,
+ c.most_recent_sql_handle)) t
+ LEFT OUTER JOIN sys.dm_exec_query_memory_grants mg
+   ON s.session_id = mg.session_id
+ WHERE (r.database_id = DB_ID('tempdb')
+   OR dt.database_id = DB_ID('tempdb'))
+  AND s.status = 'running'
+ ORDER BY SPID;
+Query to find the currently executing tasks(queries) and space used in Tempdb
+select top 10
+t1.session_id,
+t1.request_id,
+t1.task_alloc,
+     t1.task_dealloc, 
+    (SELECT SUBSTRING(text, t2.statement_start_offset/2 + 1,
+          (CASE WHEN statement_end_offset = -1
+              THEN LEN(CONVERT(nvarchar(max),text)) * 2
+                   ELSE statement_end_offset
+              END - t2.statement_start_offset)/2)
+     FROM sys.dm_exec_sql_text(sql_handle)) AS query_text,
+ (SELECT query_plan from sys.dm_exec_query_plan(t2.plan_handle)) as query_plan
+ 
+from      (Select session_id, request_id,
+sum(internal_objects_alloc_page_count +   user_objects_alloc_page_count) as task_alloc,
+sum (internal_objects_dealloc_page_count + user_objects_dealloc_page_count) as task_dealloc
+       from sys.dm_db_task_space_usage
+       group by session_id, request_id) as t1,
+       sys.dm_exec_requests as t2
+where t1.session_id = t2.session_id and
+(t1.request_id = t2.request_id) and
+      t1.session_id > 50
+order by t1.task_alloc DESC
+Query to find the currently active tasks(queries) in Tempdb
+SELECT es.host_name , es.login_name , es.program_name,
+st.dbid as QueryExecContextDBID, DB_NAME(st.dbid) as QueryExecContextDBNAME, st.objectid as ModuleObjectId,
+SUBSTRING(st.text, er.statement_start_offset/2 + 1,(CASE WHEN er.statement_end_offset = -1 THEN LEN(CONVERT(nvarchar(max),st.text)) * 2 ELSE er.statement_end_offset 
+END - er.statement_start_offset)/2) as Query_Text,
+tsu.session_id ,tsu.request_id, tsu.exec_context_id, 
+(tsu.user_objects_alloc_page_count - tsu.user_objects_dealloc_page_count) as OutStanding_user_objects_page_counts,
+(tsu.internal_objects_alloc_page_count - tsu.internal_objects_dealloc_page_count) as OutStanding_internal_objects_page_counts,
+er.start_time, er.command, er.open_transaction_count, er.percent_complete, er.estimated_completion_time, er.cpu_time, er.total_elapsed_time, er.reads,er.writes, 
+er.logical_reads, er.granted_query_memory
+FROM sys.dm_db_task_space_usage tsu inner join sys.dm_exec_requests er 
+ ON ( tsu.session_id = er.session_id and tsu.request_id = er.request_id) 
+inner join sys.dm_exec_sessions es ON ( tsu.session_id = es.session_id ) 
+CROSS APPLY sys.dm_exec_sql_text(er.sql_handle) st
+WHERE (tsu.internal_objects_alloc_page_count+tsu.user_objects_alloc_page_count) > 0
+ORDER BY (tsu.user_objects_alloc_page_count - tsu.user_objects_dealloc_page_count)+(tsu.internal_objects_alloc_page_count - tsu.internal_objects_dealloc_page_count) 
+DESC
+ 
+ 
+Query to find the oldest transactions that are active and using row versioning.
+From SQL 2005 onwards version store in tempdb is a collection of objects that are used when Snapshot Isolation or Read-Committed Snapshot Isolation or online index rebuild etc. are used in a database.
+When there are long running or orphaned transactions, tempdb growth is noticed due to the version store.
+SELECT top 5 a.session_id, a.transaction_id, a.transaction_sequence_num, a.elapsed_time_seconds,
+b.program_name, b.open_tran, b.status
+FROM sys.dm_tran_active_snapshot_database_transactions a
+join sys.sysprocesses b
+on a.session_id = b.spid
+ORDER BY elapsed_time_seconds DESC
+ 
+This query can display which databases have versioning settings on
+ 
+SELECT snapshot_isolation_state_desc,is_read_committed_snapshot_on,name from sys.databases
+ 
+Query to find the oldest active transaction in tempdb
+ 
+DBCC OPENTRAN('tempdb')
+
+
+Get Last ran query from cache 
+
+SELECT t.[text]
+FROM sys.dm_exec_cached_plans AS p
+CROSS APPLY sys.dm_exec_sql_text(p.plan_handle) AS t
+WHERE t.[text] LIKE N'%something unique about your query%';
+
+
+Partitions and record count.
+
+SELECT     
+     p.partition_id                             as PartitionID
+    ,t.name                                     as [Table]
+    ,ps.name                                    as PartitionScheme
+    ,pf.name                                    as PartitionFunction
+    ,p.partition_number                         as [Partition]
+    ,p.rows                                     as [Rows]
+    ,prv.value                                  as Boundary
+    --,pf.type_desc                               as BoundaryType
+    ,case when pf.boundary_value_on_right = 1 
+        then 'Right'
+        else 'Left'
+        end                                     as BoundarySide
+ 
+FROM 
+    sys.tables t
+    inner join sys.partitions p 
+        on t.object_id = p.object_id 
+        and p.index_id = 1
+    inner join sys.indexes i on p.object_id = i.object_id and p.index_id = i.index_id
+    inner join sys.data_spaces ds on i.data_space_id = ds.data_space_id
+    inner join sys.partition_schemes ps on ds.data_space_id = ps.data_space_id
+    inner join sys.partition_functions pf on ps.function_id = pf.function_id
+    left outer join sys.partition_range_values prv 
+        on pf.function_id = prv.function_id
+        and p.partition_number = prv.boundary_id
+WHERE
+    is_ms_shipped = 0   
+    and exists (select 1 from sys.partitions p2
+                where t.object_id = p2.object_id
+                and partition_number > 1)
+order by
+     t.name
+    ,p.partition_number desc
+
+
+AlwaysOn stauts info.
+select * from sys.dm_hadr_cluster
+select * from sys.dm_hadr_cluster_members
+select * from sys.dm_hadr_cluster_networks
+select * from sys.availability_groups
+select * from sys.dm_hadr_database_replica_states
+select * from sys.dm_hadr_database_replica_cluster_states
+select * from sys.availability_groups_cluster
+select * from sys.dm_hadr_availability_group_states
+select * from sys.availability_replicas
+select * from sys.dm_hadr_availability_replica_cluster_nodes
+select * from sys.dm_hadr_availability_replica_cluster_states
+select * from sys.dm_hadr_availability_replica_states
+select * from sys.dm_hadr_auto_page_repair
+select * from sys.availability_group_listener_ip_addresses
+select * from sys.availability_group_listeners
+select * from sys.dm_tcp_listener_states
+
+Read_only Routing list.
+
+SELECT ag.name as "Availability Group", ar.replica_server_name as "When Primary Replica Is",
+        rl.routing_priority as "Routing Priority", ar2.replica_server_name as "RO Routed To",
+        ar.secondary_role_allow_connections_desc, ar2.read_only_routing_url
+FROM sys.availability_read_only_routing_lists rl
+        inner join sys.availability_replicas ar on rl.replica_id = ar.replica_id
+        inner join sys.availability_replicas ar2 on rl.read_only_replica_id = ar2.replica_id
+        inner join sys.availability_groups ag on ar.group_id = ag.group_id
+ORDER BY ag.name, ar.replica_server_name, rl.routing_priority
+
+
+PerfMon counters for AlwaysOn
+
+select object_name,counter_name,instance_name,cntr_value
+from sys.dm_os_performance_counters
+ where object_name like '%replica%'
+
+---Script to find which Databases are involved in Mirroring
+select DB_NAME(database_id)as dbname,mirroring_state_desc,mirroring_role_desc,
+mirroring_safety_level_desc,mirroring_partner_name,mirroring_partner_instance,mirroring_witness_state,mirroring_witness_state_desc
+from master.sys.database_mirroring
+where mirroring_state is not null
+ 
+---Detailed Script to find which Databases are involved in Mirroring
+select DB_NAME(database_id)dbname,mirroring_state_desc,mirroring_role_desc,
+mirroring_safety_level_desc,mirroring_safety_sequence
+mirroring_partner_name,mirroring_partner_instance,
+mirroring_witness_state,mirroring_witness_state_desc,
+mirroring_failover_lsn,mirroring_connection_timeout,mirroring_redo_queue,
+mirroring_end_of_log_lsn,mirroring_replication_lsn
+from master.sys.database_mirroring
+where mirroring_state is not null
+ 
+---Below script is used to check the connection details
+---which are involed in Database Mirroring
+Select state_desc,connect_time,login_time,authentication_method,principal_name,
+remote_user_name,last_activity_time,is_accept,login_state_desc,
+receives_posted,sends_posted,total_bytes_sent,total_bytes_received,
+total_sends,total_receives
+from sys.dm_db_mirroring_connections
+
+
