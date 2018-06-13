@@ -1,0 +1,575 @@
+Count of current locks and status
+
+select  req_status, count(req_status) No_of_locks from sys.syslockinfo group by req_status
+
+--Run the following query to get the TOP 50 cached plans that consumed the most cumulative CPU
+--All times are in microseconds
+
+SELECT TOP 50 qs.creation_time, qs.execution_count, qs.total_worker_time as total_cpu_time, qs.max_worker_time as max_cpu_time, 
+qs.total_elapsed_time, qs.max_elapsed_time, qs.total_logical_reads, qs.max_logical_reads, qs.total_physical_reads, 
+qs.max_physical_reads,t.[text], qp.query_plan, t.dbid, t.objectid, t.encrypted, qs.plan_handle, qs.plan_generation_num
+FROM sys.dm_exec_query_stats qs 
+CROSS APPLY sys.dm_exec_sql_text(plan_handle) AS t
+CROSS APPLY sys.dm_exec_query_plan(plan_handle) AS qp
+ORDER BY qs.total_worker_time DESC
+
+-- List expensive queries 
+DECLARE @MinExecutions int; 
+SET @MinExecutions = 5 
+ 
+SELECT EQS.total_worker_time AS TotalWorkerTime 
+      ,EQS.total_logical_reads + EQS.total_logical_writes AS TotalLogicalIO 
+      ,EQS.execution_count As ExeCnt 
+      ,EQS.last_execution_time AS LastUsage 
+      ,EQS.total_worker_time / EQS.execution_count as AvgCPUTimeMiS 
+      ,(EQS.total_logical_reads + EQS.total_logical_writes) / EQS.execution_count  
+       AS AvgLogicalIO 
+      ,DB.name AS DatabaseName 
+      ,SUBSTRING(EST.text 
+                ,1 + EQS.statement_start_offset / 2 
+                ,(CASE WHEN EQS.statement_end_offset = -1  
+                       THEN LEN(convert(nvarchar(max), EST.text)) * 2  
+                       ELSE EQS.statement_end_offset END  
+                 - EQS.statement_start_offset) / 2 
+                ) AS SqlStatement 
+      -- Optional with Query plan; remove comment to show, but then the query takes !!much longer time!! 
+      --,EQP.[query_plan] AS [QueryPlan] 
+FROM sys.dm_exec_query_stats AS EQS 
+     CROSS APPLY sys.dm_exec_sql_text(EQS.sql_handle) AS EST 
+     CROSS APPLY sys.dm_exec_query_plan(EQS.plan_handle) AS EQP 
+     LEFT JOIN sys.databases AS DB 
+         ON EST.dbid = DB.database_id      
+WHERE EQS.execution_count > @MinExecutions 
+      AND EQS.last_execution_time > DATEDIFF(MONTH, -1, GETDATE()) 
+ORDER BY AvgLogicalIo DESC 
+        ,AvgCPUTimeMiS DESC
+
+From <https://gallery.technet.microsoft.com/scriptcenter/List-expensive-queries-f6d63ac6/description> 
+
+
+ 
+
+Lead Blocker
+
+SELECT
+    spid
+    ,sp.STATUS
+    ,loginame   = SUBSTRING(loginame, 1, 12)
+    ,hostname   = SUBSTRING(hostname, 1, 12)
+    ,blk        = CONVERT(CHAR(3), blocked)
+    ,open_tran
+    ,dbname     = SUBSTRING(DB_NAME(sp.dbid),1,10)
+    ,cmd
+    ,waittype
+    ,waittime
+    ,last_batch
+    ,SQLStatement       =
+        SUBSTRING
+        (
+            qt.text,
+            er.statement_start_offset/2,
+            (CASE WHEN er.statement_end_offset = -1
+                THEN LEN(CONVERT(nvarchar(MAX), qt.text)) * 2
+                ELSE er.statement_end_offset
+                END - er.statement_start_offset)/2
+        )
+FROM master.dbo.sysprocesses sp
+LEFT JOIN sys.dm_exec_requests er
+    ON er.session_id = sp.spid
+OUTER APPLY sys.dm_exec_sql_text(er.sql_handle) AS qt
+WHERE spid IN (SELECT blocked FROM master.dbo.sysprocesses)
+AND blocked = 0
+
+What is currently running
+
+SELECT  *
+FROM    sys.dm_exec_requests AS der
+        CROSS APPLY sys.dm_exec_sql_text(der.sql_handle) AS dest
+        CROSS APPLY sys.dm_exec_query_plan(der.plan_handle) AS deqp;
+GO
+
+SELECT  SUBSTRING(dest.text, ( der.statement_start_offset / 2 ) + 1,
+                  ( CASE der.statement_end_offset
+                      WHEN -1 THEN DATALENGTH(dest.text)
+                      ELSE der.statement_end_offset
+                           - der.statement_start_offset
+                    END ) / 2 + 1) AS querystatement ,
+        deqp.query_plan ,
+        der.session_id ,
+        der.start_time ,
+        der.status ,
+        DB_NAME(der.database_id) AS DBName ,
+        USER_NAME(der.user_id) AS UserName ,
+        der.blocking_session_id ,
+        der.wait_type ,
+        der.wait_time ,
+        der.wait_resource ,
+        der.last_wait_type ,
+        der.cpu_time ,
+        der.total_elapsed_time ,
+        der.reads ,
+        der.writes
+FROM    sys.dm_exec_requests AS der
+        CROSS APPLY sys.dm_exec_sql_text(der.sql_handle) AS dest
+        CROSS APPLY sys.dm_exec_query_plan(der.plan_handle) AS deqp;
+GO
+
+
+SELECT      r.start_time [Start Time],session_ID [SPID],
+            DB_NAME(database_id) [Database],
+            SUBSTRING(t.text,(r.statement_start_offset/2)+1,
+            CASE WHEN statement_end_offset=-1 OR statement_end_offset=0 
+            THEN (DATALENGTH(t.Text)-r.statement_start_offset/2)+1 
+            ELSE (r.statement_end_offset-r.statement_start_offset)/2+1
+            END) [Executing SQL], 
+            Status,command,wait_type,wait_time,wait_resource, 
+            last_wait_type
+FROM        sys.dm_exec_requests r
+OUTER APPLY sys.dm_exec_sql_text(sql_handle) t
+WHERE       session_id != @@SPID -- don't show this query
+AND         session_id > 50 -- don't show system queries
+ORDER BY    r.start_time
+
+
+Pasted from <https://www.simple-talk.com/sql/t-sql-programming/top-10-most-common-database-scripts/> 
+
+T-SQL to get various details on currently running Active processes on SQL Server
+USE MASTER 
+GO 
+SELECT SPID,ER.percent_complete, 
+/* This piece of code has been taken from article. Nice code to get time criteria's 
+http://beyondrelational.com/blogs/geniiius/archive/2011/11/01/backup-restore-checkdb-shrinkfile-progress.aspx 
+*/ 
+    CAST(((DATEDIFF(s,start_time,GetDate()))/3600) as varchar) + ' hour(s), ' 
+        + CAST((DATEDIFF(s,start_time,GetDate())%3600)/60 as varchar) + 'min, ' 
+        + CAST((DATEDIFF(s,start_time,GetDate())%60) as varchar) + ' sec' as running_time, 
+    CAST((estimated_completion_time/3600000) as varchar) + ' hour(s), ' 
+        + CAST((estimated_completion_time %3600000)/60000 as varchar) + 'min, ' 
+        + CAST((estimated_completion_time %60000)/1000 as varchar) + ' sec' as est_time_to_go, 
+    DATEADD(second,estimated_completion_time/1000, getdate()) as est_completion_time, 
+/* End of Article Code */     
+ER.command,ER.blocking_session_id, SP.DBID,LASTWAITTYPE,  
+DB_NAME(SP.DBID) AS DBNAME, 
+replace(replace(SUBSTRING(est.text,(ER.statement_start_offset/2)+1,  
+        ((CASE ER.statement_end_offset 
+         WHEN -1 THEN DATALENGTH(est.text) 
+         ELSE ER.statement_end_offset 
+         END - ER.statement_start_offset)/2) + 1),char(10),''),char(13),'') AS QueryText, 
+replace(replace(TEXT,char(10),''),char(13),''),CPU,HOSTNAME,LOGIN_TIME,LOGINAME, 
+SP.status,PROGRAM_NAME,NT_DOMAIN, NT_USERNAME 
+FROM SYSPROCESSES SP  
+INNER JOIN sys.dm_exec_requests ER 
+ON sp.spid = ER.session_id 
+CROSS APPLY SYS.DM_EXEC_SQL_TEXT(er.sql_handle) EST 
+ORDER BY CPU DESC    
+
+
+From <https://gallery.technet.microsoft.com/scriptcenter/T-SQL-to-get-various-041b67d3/description> 
+
+
+Find fragmentation level -(NGAVS)
+
+SELECT OBJECT_NAME(ind.OBJECT_ID) AS TableName, 
+ind.name AS IndexName, indexstats.index_type_desc AS IndexType, 
+indexstats.avg_fragmentation_in_percent ,
+--'Alter Index '+ind.name  +' ON '+OBJECT_NAME(ind.OBJECT_ID)+ ' rebuild'
+FROM sys.dm_db_index_physical_stats(DB_ID(), NULL, NULL, NULL, NULL) indexstats 
+INNER JOIN sys.indexes ind  
+ON ind.object_id = indexstats.object_id 
+AND ind.index_id = indexstats.index_id 
+WHERE indexstats.avg_fragmentation_in_percent > 0  
+--and OBJECT_NAME(ind.OBJECT_ID) like 'ngavs_ads_%'
+ORDER BY indexstats.avg_fragmentation_in_percent DESC
+
+-- Query to get current queries and its Wait stats ***
+
+  SELECT s.session_id
+    ,r.STATUS
+    ,r.blocking_session_id 'blocked by'
+    ,r.wait_type
+    ,wait_resource
+    ,r.wait_time / (1000.0) 'Wait Time (in Sec)'
+    ,r.cpu_time
+    ,r.logical_reads
+    ,r.reads
+    ,r.writes
+	,CAST(((DATEDIFF(s,start_time,GetDate()))/3600) as varchar) + ' hour(s), ' 
+        + CAST((DATEDIFF(s,start_time,GetDate())%3600)/60 as varchar) + 'min, ' 
+        + CAST((DATEDIFF(s,start_time,GetDate())%60) as varchar) + ' sec' as running_time
+	,CAST((estimated_completion_time/3600000) as varchar) + ' hour(s), '
+         + CAST((estimated_completion_time %3600000)/60000 as varchar) + 'min, '
+         + CAST((estimated_completion_time %60000)/1000 as varchar) + ' sec' as est_time_to_go
+     ,dateadd(second,estimated_completion_time/1000, getdate()) as est_completion_time
+    ,case when s.transaction_isolation_level = 1 then 'READ_UNCOMMITTED'
+when s.transaction_isolation_level = 2 then 'Read Commited'
+when s.transaction_isolation_level =  3 then 'Repetable Reads' 
+when s.transaction_isolation_level = 4 then 'Serialized Reads' 
+when s.transaction_isolation_level = 5 then 'Snapshot' end as transaction_isolation_level 
+    ,r.total_elapsed_time / (1000.0) 'Elapsed Time (in Sec)'
+	 ,s.login_name
+    ,replace(replace(Substring(st.TEXT, (r.statement_start_offset / 2) + 1, (
+            (
+                CASE r.statement_end_offset
+                    WHEN - 1
+                        THEN Datalength(st.TEXT)
+                    ELSE r.statement_end_offset
+                    END - r.statement_start_offset
+                ) / 2
+            ) + 1),char(10),''),char(13), '') AS statement_text
+    ,Coalesce(Quotename(Db_name(st.dbid)) + N'.' + Quotename(Object_schema_name(st.objectid, st.dbid)) + N'.' + 
+     Quotename(Object_name(st.objectid, st.dbid)), '') AS command_text
+    ,r.command
+    ,s.host_name
+    ,s.program_name
+    ,s.host_process_id
+    ,s.last_request_end_time
+    ,s.login_time
+    ,r.open_transaction_count
+FROM sys.dm_exec_sessions AS s
+INNER JOIN sys.dm_exec_requests AS r ON r.session_id = s.session_id
+CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) AS st
+WHERE r.session_id != @@SPID  --and host_name like 'ECCWS1816B' --and st.TEXT like '%SOWSM00_RAW_XML_FILE%'
+--and s.login_name like '%OWS_SEDC_APPL%' --or s.login_name like 'OWSClaims_ETL_RO%'
+ORDER BY r.cpu_time DESC
+    ,r.STATUS
+    ,r.blocking_session_id
+    ,s.session_id 
+
+
+--Average response time resource, latch waits
+
+SELECT avg(total_elapsed_time / execution_count)/1000 As avg_query_response_time 
+--total_avg_elapsed_time (div by 1000 for ms, div by 1000000 for sec)
+FROM sys.dm_exec_query_stats
+
+SELECT AVG(current_tasks_count) AS [Avg Current Task],
+AVG(runnable_tasks_count) AS [Avg Wait Task]
+FROM sys.dm_os_schedulers
+WHERE scheduler_id < 255 
+
+Select
+    ResourceWaitTimeMs=sum(wait_time_ms - signal_wait_time_ms)
+  ,'%resource waits'= cast(100.0 * sum(wait_time_ms - signal_wait_time_ms) / sum 
+  (wait_time_ms) as numeric(20,2))
+  ,SignalWaitTimeMs=sum(signal_wait_time_ms)
+  ,'%signal waits' = cast(100.0 * sum(signal_wait_time_ms) / sum (wait_time_ms) as 
+  numeric(20,2))
+from sys.dm_os_wait_stats
+
+
+select * from sys.dm_os_latch_stats order by wait_time_ms DESC
+
+
+SELECT scheduler_id, current_tasks_count, runnable_tasks_count
+FROM sys.dm_os_schedulers
+WHERE scheduler_id < 255 AND runnable_tasks_count >0
+
+set nocount on
+declare @ts_now bigint
+select @ts_now = cpu_ticks /( cpu_ticks / ms_ticks )
+from sys.dm_os_sys_info
+select /*top 1*/ record_id,dateadd(ms, -1 * (@ts_now - [timestamp]), GetDate()) as EventTime,
+SQLProcessUtilization,SystemIdle,100 - SystemIdle - SQLProcessUtilization as OtherProcessUtilization
+from (select record.value('(./Record/@id)[1]', 'int') as record_id,
+    record.value('(./Record/SchedulerMonitorEvent/SystemHealth/SystemIdle)[1]', 'int') as SystemIdle,
+record.value('(./Record/SchedulerMonitorEvent/SystemHealth/ProcessUtilization)[1]', 'int') as SQLProcessUtilization,
+timestamp from (select timestamp, convert(xml, record) as record
+from sys.dm_os_ring_buffers
+where ring_buffer_type = N'RING_BUFFER_SCHEDULER_MONITOR' and record like '%<SystemHealth>%') as x
+) as y order by record_id desc
+
+
+select r.session_id,status,substring(qt.text,r.statement_start_offset/2,
+(case when r.statement_end_offset = -1
+then len(convert(nvarchar(max), qt.text)) * 2
+else r.statement_end_offset end - r.statement_start_offset)/2)
+as query_text   --- this is the statement executing right now
+,qt.dbid
+,qt.objectid
+,r.cpu_time
+,r.total_elapsed_time
+,r.reads
+,r.writes
+,r.logical_reads
+,r.scheduler_id
+from sys.dm_exec_requests r
+cross apply sys.dm_exec_sql_text(sql_handle) as qt
+where r.session_id > 50
+order by r.scheduler_id, r.status, r.session_id
+
+
+
+-- Get CPU utilization by database (Query 29) (CPU Usage by Database)
+WITH DB_CPU_Stats
+AS
+(SELECT DatabaseID, DB_Name(DatabaseID) AS [Database Name], SUM(total_worker_time) AS [CPU_Time_Ms]
+ FROM sys.dm_exec_query_stats AS qs
+ CROSS APPLY (SELECT CONVERT(int, value) AS [DatabaseID] 
+              FROM sys.dm_exec_plan_attributes(qs.plan_handle)
+              WHERE attribute = N'dbid') AS F_DB
+ GROUP BY DatabaseID)
+SELECT ROW_NUMBER() OVER(ORDER BY [CPU_Time_Ms] DESC) AS [CPU Rank],
+       [Database Name], [CPU_Time_Ms] AS [CPU Time (ms)], 
+       CAST([CPU_Time_Ms] * 1.0 / SUM([CPU_Time_Ms]) OVER() * 100.0 AS DECIMAL(5, 2)) AS [CPU Percent]
+FROM DB_CPU_Stats
+WHERE DatabaseID <> 32767 -- ResourceDB
+ORDER BY [CPU Rank] OPTION (RECOMPILE);
+
+
+-- Get I/O utilization by database (Query 30) (IO Usage By Database)
+WITH Aggregate_IO_Statistics
+AS
+(SELECT DB_NAME(database_id) AS [Database Name],
+CAST(SUM(num_of_bytes_read + num_of_bytes_written)/1048576 AS DECIMAL(12, 2)) AS io_in_mb
+FROM sys.dm_io_virtual_file_stats(NULL, NULL) AS [DM_IO_STATS]
+GROUP BY database_id)
+SELECT ROW_NUMBER() OVER(ORDER BY io_in_mb DESC) AS [I/O Rank], [Database Name], io_in_mb AS [Total I/O (MB)],
+       CAST(io_in_mb/ SUM(io_in_mb) OVER() * 100.0 AS DECIMAL(5,2)) AS [I/O Percent]
+FROM Aggregate_IO_Statistics
+ORDER BY [I/O Rank] OPTION (RECOMPILE);
+
+-- Get total buffer usage by database for current instance  (Query 31) (Total Buffer Usage by Database)
+-- This make take some time to run on a busy instance
+WITH AggregateBufferPoolUsage
+AS
+(SELECT DB_NAME(database_id) AS [Database Name],
+CAST(COUNT(*) * 8/1024.0 AS DECIMAL (10,2))  AS [CachedSize]
+FROM sys.dm_os_buffer_descriptors WITH (NOLOCK)
+WHERE database_id <> 32767 -- ResourceDB
+GROUP BY DB_NAME(database_id))
+SELECT ROW_NUMBER() OVER(ORDER BY CachedSize DESC) AS [Buffer Pool Rank], [Database Name], CachedSize AS [Cached Size (MB)],
+       CAST(CachedSize / SUM(CachedSize) OVER() * 100.0 AS DECIMAL(5,2)) AS [Buffer Pool Percent]
+FROM AggregateBufferPoolUsage
+ORDER BY [Buffer Pool Rank] OPTION (RECOMPILE);
+
+-- Missing Indexes for current database by Index Advantage  (Query 57) (Missing Indexes)
+SELECT DISTINCT CONVERT(decimal(18,2), user_seeks * avg_total_user_cost * (avg_user_impact * 0.01)) AS [index_advantage], 
+migs.last_user_seek, mid.[statement] AS [Database.Schema.Table],
+mid.equality_columns, mid.inequality_columns, mid.included_columns,
+migs.unique_compiles, migs.user_seeks, migs.avg_total_user_cost, migs.avg_user_impact,
+OBJECT_NAME(mid.[object_id]) AS [Table Name], p.rows AS [Table Rows]
+FROM sys.dm_db_missing_index_group_stats AS migs WITH (NOLOCK)
+INNER JOIN sys.dm_db_missing_index_groups AS mig WITH (NOLOCK)
+ON migs.group_handle = mig.index_group_handle
+INNER JOIN sys.dm_db_missing_index_details AS mid WITH (NOLOCK)
+ON mig.index_handle = mid.index_handle
+INNER JOIN sys.partitions AS p WITH (NOLOCK)
+ON p.[object_id] = mid.[object_id]
+WHERE mid.database_id = DB_ID() 
+ORDER BY index_advantage DESC OPTION (RECOMPILE);
+
+-- Get all SQL Statements with missing indexes and their cached query plans 
+;WITH  
+ XMLNAMESPACES 
+     (DEFAULT N'http://schemas.microsoft.com/sqlserver/2004/07/showplan'   
+             ,N'http://schemas.microsoft.com/sqlserver/2004/07/showplan' AS ShowPlan)       
+SELECT ECP.[usecounts]    AS [UsageCounts] 
+      ,ECP.[refcounts]    AS [RefencedCounts] 
+      ,ECP.[objtype]      AS [ObjectType] 
+      ,ECP.[cacheobjtype] AS [CacheObjectType] 
+      ,EST.[dbid]         AS [DatabaseID] 
+      ,EST.[objectid]     AS [ObjectID] 
+      ,EST.[text]         AS [Statement]       
+      ,EQP.[query_plan]   AS [QueryPlan] 
+FROM sys.dm_exec_cached_plans AS ECP 
+     CROSS APPLY sys.dm_exec_sql_text(ECP.[plan_handle]) AS EST 
+     CROSS APPLY sys.dm_exec_query_plan(ECP.[plan_handle]) AS EQP 
+WHERE ECP.[usecounts] > 1  -- Plan should be used more then one time (= no AdHoc queries) 
+      AND EQP.[query_plan].exist(N'/ShowPlanXML/BatchSequence/Batch/Statements/StmtSimple/QueryPlan/MissingIndexes/MissingIndexGroup') <> 0 
+ORDER BY ECP.[usecounts] DESC
+
+
+-- When were Statistics last updated on all indexes?  (Query 63) (Statistics Update)
+SELECT SCHEMA_NAME(o.Schema_ID) + N'.' + o.NAME AS [Object Name], o.type_desc AS [Object Type],
+      i.name AS [Index Name], STATS_DATE(i.[object_id], i.index_id) AS [Statistics Date], 
+      s.auto_created, s.no_recompute, s.user_created, st.row_count, st.used_page_count
+FROM sys.objects AS o WITH (NOLOCK)
+INNER JOIN sys.indexes AS i WITH (NOLOCK)
+ON o.[object_id] = i.[object_id]
+INNER JOIN sys.stats AS s WITH (NOLOCK)
+ON i.[object_id] = s.[object_id] 
+AND i.index_id = s.stats_id
+INNER JOIN sys.dm_db_partition_stats AS st WITH (NOLOCK)
+ON o.[object_id] = st.[object_id]
+AND i.[index_id] = st.[index_id]
+WHERE o.[type] IN ('U', 'V')
+AND st.row_count > 0
+ORDER BY STATS_DATE(i.[object_id], i.index_id) DESC OPTION (RECOMPILE);  
+
+
+-- Breaks down buffers used by current database by object (table, index) in the buffer cache  (Query 59) (Buffer Usage)
+-- Note: This query could take some time on a busy instance
+SELECT OBJECT_NAME(p.[object_id]) AS [Object Name], p.index_id, 
+CAST(COUNT(*)/128.0 AS DECIMAL(10, 2)) AS [Buffer size(MB)],  
+COUNT(*) AS [BufferCount], p.Rows AS [Row Count],
+p.data_compression_desc AS [Compression Type]
+FROM sys.allocation_units AS a WITH (NOLOCK)
+INNER JOIN sys.dm_os_buffer_descriptors AS b WITH (NOLOCK)
+ON a.allocation_unit_id = b.allocation_unit_id
+INNER JOIN sys.partitions AS p WITH (NOLOCK)
+ON a.container_id = p.hobt_id
+WHERE b.database_id = CONVERT(int,DB_ID())
+AND p.[object_id] > 100
+GROUP BY p.[object_id], p.index_id, p.data_compression_desc, p.[Rows]
+ORDER BY [BufferCount] DESC OPTION (RECOMPILE);
+
+
+--Know Fetch Cursor call commands.  Ex: FETCH API_CURSOR00000000000086B0 *****
+
+SELECT creation_time,
+cursor_id,
+c.session_id,
+c.properties,
+c.creation_time,
+c.is_open,
+replace(replace(SUBSTRING(st.TEXT, ( c.statement_start_offset / 2) + 1, (
+( CASE c.statement_end_offset
+WHEN -1 THEN DATALENGTH(st.TEXT)
+ELSE c.statement_end_offset
+END - c.statement_start_offset) / 2) + 1),char(10),''),char(13),'') AS statement_text
+FROM   sys.Dm_exec_cursors(0) AS c
+JOIN sys.dm_exec_sessions AS s
+ON c.session_id = s.session_id
+CROSS apply sys.Dm_exec_sql_text(c.sql_handle) AS st
+GO
+
+-- Missing indexes with CREATE statement for it 
+
+SELECT MID.[statement] AS ObjectName 
+      ,MID.equality_columns AS EqualityColumns 
+      ,MID.inequality_columns AS InequalityColms 
+      ,MID.included_columns AS IncludedColumns 
+      ,MIGS.last_user_seek AS LastUserSeek 
+      ,MIGS.avg_total_user_cost  
+       * MIGS.avg_user_impact  
+       * (MIGS.user_seeks + MIGS.user_scans) AS Impact 
+      ,N'CREATE NONCLUSTERED INDEX <Add Index Name here> ' +  
+       N'ON ' + MID.[statement] +  
+       N' (' + MID.equality_columns  
+             + ISNULL(', ' + MID.inequality_columns, N'') + 
+       N') ' + ISNULL(N'INCLUDE (' + MID.included_columns + N');', ';') 
+       AS CreateStatement 
+FROM sys.dm_db_missing_index_group_stats AS MIGS 
+     INNER JOIN sys.dm_db_missing_index_groups AS MIG 
+         ON MIGS.group_handle = MIG.index_group_handle 
+     INNER JOIN sys.dm_db_missing_index_details AS MID 
+         ON MIG.index_handle = MID.index_handle 
+WHERE database_id = DB_ID() 
+      AND MIGS.last_user_seek >= DATEDIFF(month, GetDate(), -1) 
+ORDER BY Impact DESC;
+
+From <https://gallery.technet.microsoft.com/scriptcenter/Missing-indexes-with-34edd093/description> 
+
+Index usage stats
+
+SELECT o.name Object_Name,
+       SCHEMA_NAME(o.schema_id) Schema_name,
+       i.name Index_name, 
+       i.Type_Desc, 
+       s.user_seeks,
+       s.user_scans, 
+       s.user_lookups, 
+       s.user_updates  
+ FROM sys.objects AS o
+     JOIN sys.indexes AS i
+ ON o.object_id = i.object_id 
+     JOIN
+  sys.dm_db_index_usage_stats AS s    
+ ON i.object_id = s.object_id   
+  AND i.index_id = s.index_id
+ WHERE  o.type = 'u'
+ --Clustered and Non-Clustered indexes
+  AND i.type IN (1, 2) 
+ --Indexes that have been updated by not used
+  AND(s.user_seeks > 0 or s.user_scans > 0 or s.user_lookups > 0 ) and i.name like 'IX_pc_assign_workbasket_px%'
+
+Current memory utilization details
+
+/*============================================================================ 
+Script to report Memory usage details of a SQL Server instance 
+Author: Sakthivel Chidambaram, Microsoft http://blogs.msdn.com/b/sqlsakthi 
+
+Date: June 2012 
+Version: V2 
+
+V1: Initial Release 
+V2: Added PLE, Memory grants pending, Checkpoint, Lazy write,Free list counters 
+
+THIS CODE AND INFORMATION ARE PROVIDED "AS IS" WITHOUT WARRANTY OF 
+ANY KIND, EITHER EXPRESSED OR IMPLIED, INCLUDING BUT NOT LIMITED 
+TO THE IMPLIED WARRANTIES OF MERCHANTABILITY AND/OR FITNESS FOR A 
+PARTICULAR PURPOSE. 
+
+============================================================================*/ 
+-- We don't need the row count 
+SET NOCOUNT ON 
+
+-- Get size of SQL Server Page in bytes 
+DECLARE @pg_size INT, @Instancename varchar(50) 
+SELECT @pg_size = low from master..spt_values where number = 1 and type = 'E' 
+
+-- Extract perfmon counters to a temporary table 
+IF OBJECT_ID('tempdb..#perfmon_counters') is not null DROP TABLE #perfmon_counters 
+SELECT * INTO #perfmon_counters FROM sys.dm_os_performance_counters 
+
+-- Get SQL Server instance name 
+SELECT @Instancename = LEFT([object_name], (CHARINDEX(':',[object_name]))) FROM #perfmon_counters WHERE counter_name = 'Buffer cache hit ratio' 
+
+-- Print Memory usage details 
+PRINT '----------------------------------------------------------------------------------------------------' 
+PRINT 'Memory usage details for SQL Server instance ' + @@SERVERNAME + ' (' + CAST(SERVERPROPERTY('productversion') AS VARCHAR) + ' - ' + SUBSTRING(@@VERSION, CHARINDEX('X',@@VERSION),4) + ' - ' + CAST(SERVERPROPERTY('edition') AS VARCHAR) + ')' 
+PRINT '----------------------------------------------------------------------------------------------------' 
+SELECT 'Memory visible to the Operating System' 
+SELECT CEILING(physical_memory_in_bytes/1048576.0) as [Physical Memory_MB], CEILING(physical_memory_in_bytes/1073741824.0) as [Physical Memory_GB], CEILING(virtual_memory_in_bytes/1073741824.0) as [Virtual Memory GB] FROM sys.dm_os_sys_info 
+SELECT 'Buffer Pool Usage at the Moment' 
+SELECT (bpool_committed*8)/1024.0 as BPool_Committed_MB, (bpool_commit_target*8)/1024.0 as BPool_Commit_Tgt_MB,(bpool_visible*8)/1024.0 as BPool_Visible_MB FROM sys.dm_os_sys_info 
+SELECT 'Total Memory used by SQL Server Buffer Pool as reported by Perfmon counters' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Total Server Memory (KB)' 
+SELECT 'Memory needed as per current Workload for SQL Server instance' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Target Server Memory (KB)' 
+SELECT 'Total amount of dynamic memory the server is using for maintaining connections' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Connection Memory (KB)' 
+SELECT 'Total amount of dynamic memory the server is using for locks' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Lock Memory (KB)' 
+SELECT 'Total amount of dynamic memory the server is using for the dynamic SQL cache' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'SQL Cache Memory (KB)' 
+SELECT 'Total amount of dynamic memory the server is using for query optimization' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Optimizer Memory (KB) ' 
+SELECT 'Total amount of dynamic memory used for hash, sort and create index operations.' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Granted Workspace Memory (KB) ' 
+SELECT 'Total Amount of memory consumed by cursors' 
+SELECT cntr_value as Mem_KB, cntr_value/1024.0 as Mem_MB, (cntr_value/1048576.0) as Mem_GB FROM #perfmon_counters WHERE counter_name = 'Cursor memory usage' and instance_name = '_Total' 
+SELECT 'Number of pages in the buffer pool (includes database, free, and stolen).' 
+SELECT cntr_value as [8KB_Pages], (cntr_value*@pg_size)/1024.0 as Pages_in_KB, (cntr_value*@pg_size)/1048576.0 as Pages_in_MB FROM #perfmon_counters WHERE object_name= @Instancename+'Buffer Manager' and counter_name = 'Total pages' 
+SELECT 'Number of Data pages in the buffer pool' 
+SELECT cntr_value as [8KB_Pages], (cntr_value*@pg_size)/1024.0 as Pages_in_KB, (cntr_value*@pg_size)/1048576.0 as Pages_in_MB FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Database pages' 
+SELECT 'Number of Free pages in the buffer pool' 
+SELECT cntr_value as [8KB_Pages], (cntr_value*@pg_size)/1024.0 as Pages_in_KB, (cntr_value*@pg_size)/1048576.0 as Pages_in_MB FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Free pages' 
+SELECT 'Number of Reserved pages in the buffer pool' 
+SELECT cntr_value as [8KB_Pages], (cntr_value*@pg_size)/1024.0 as Pages_in_KB, (cntr_value*@pg_size)/1048576.0 as Pages_in_MB FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Reserved pages' 
+SELECT 'Number of Stolen pages in the buffer pool' 
+SELECT cntr_value as [8KB_Pages], (cntr_value*@pg_size)/1024.0 as Pages_in_KB, (cntr_value*@pg_size)/1048576.0 as Pages_in_MB FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Stolen pages' 
+SELECT 'Number of Plan Cache pages in the buffer pool' 
+SELECT cntr_value as [8KB_Pages], (cntr_value*@pg_size)/1024.0 as Pages_in_KB, (cntr_value*@pg_size)/1048576.0 as Pages_in_MB FROM #perfmon_counters WHERE object_name=@Instancename+'Plan Cache' and counter_name = 'Cache Pages' and instance_name = '_Total' 
+SELECT 'Page Life Expectancy - Number of seconds a page will stay in the buffer pool without references' 
+SELECT cntr_value as [Page Life in seconds],CASE WHEN (cntr_value > 300) THEN 'PLE is Healthy' ELSE 'PLE is not Healthy' END as 'PLE Status' FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Page life expectancy' 
+SELECT 'Number of requests per second that had to wait for a free page' 
+SELECT cntr_value as [Free list stalls/sec] FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Free list stalls/sec' 
+SELECT 'Number of pages flushed to disk/sec by a checkpoint or other operation that require all dirty pages to be flushed' 
+SELECT cntr_value as [Checkpoint pages/sec] FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Checkpoint pages/sec' 
+SELECT 'Number of buffers written per second by the buffer manager"s lazy writer' 
+SELECT cntr_value as [Lazy writes/sec] FROM #perfmon_counters WHERE object_name=@Instancename+'Buffer Manager' and counter_name = 'Lazy writes/sec' 
+SELECT 'Total number of processes waiting for a workspace memory grant' 
+SELECT cntr_value as [Memory Grants Pending] FROM #perfmon_counters WHERE object_name=@Instancename+'Memory Manager' and counter_name = 'Memory Grants Pending' 
+SELECT 'Total number of processes that have successfully acquired a workspace memory grant' 
+SELECT cntr_value as [Memory Grants Outstanding] FROM #perfmon_counters WHERE object_name=@Instancename+'Memory Manager' and counter_name = 'Memory Grants Outstanding'
+
+From <https://blogs.msdn.microsoft.com/sqlsakthi/2011/02/28/t-sql-query-script-to-monitor-memory-usage-of-a-sql-server-instance/> 
+
+
+
+SQL IO troubleshooting
+
+SELECT SUM(pending_disk_io_count) AS [Number of pending I/Os] FROM sys.dm_os_schedulers 
+
+SELECT *  FROM sys.dm_io_pending_io_requests
